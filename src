@@ -1,1 +1,354 @@
+import {
+    Connection,
+    PublicKey,
+    Transaction,
+    SystemProgram,
+    TransactionInstruction,
+    AccountInfo,
+    ParsedAccountData,
+    Keypair
+} from '@solana/web3.js';
+import { struct, u8, u64, u128 } from '@solana/buffer-layout';
+import { Buffer } from 'buffer';
 
+// Types and Interfaces
+interface PoolState {
+    tokenAReserves: bigint;
+    tokenBReserves: bigint;
+    lastUpdateTimestamp: number;
+    fees: {
+        tradeFee: number;
+        ownerFee: number;
+    };
+}
+
+interface MarketState {
+    baseMint: PublicKey;
+    quoteMint: PublicKey;
+    baseVault: PublicKey;
+    quoteVault: PublicKey;
+    poolState: PoolState;
+}
+
+interface DexRoute {
+    protocol: string;
+    inputMint: PublicKey;
+    outputMint: PublicKey;
+    marketAddress: PublicKey;
+    poolState?: PoolState;
+    intermediateTokens?: PublicKey[];
+}
+
+interface RoutingInfo {
+    route: DexRoute[];
+    expectedOutputAmount: bigint;
+    priceImpact: number;
+    estimatedFees: bigint;
+}
+
+interface SwapQuote {
+    expectedAmount: bigint;
+    priceImpact: number;
+    fees: bigint;
+    minOutputAmount: bigint;
+}
+
+// Market state layout for Raydium
+const RAYDIUM_POOL_STATE_LAYOUT = struct([
+    u64('tokenAReserves'),
+    u64('tokenBReserves'),
+    u64('lastUpdateTimestamp'),
+    struct([
+        u64('tradeFee'),
+        u64('ownerFee'),
+    ], 'fees'),
+]);
+
+class CustomDexAggregator {
+    private connection: Connection;
+    private readonly RAYDIUM_PROGRAM_ID = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
+    private readonly ORCA_PROGRAM_ID = new PublicKey('9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP');
+    private readonly SERUM_PROGRAM_ID = new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin');
+    
+    private marketCache: Map<string, MarketState>;
+    private poolStateSubscriptions: Map<string, number>;
+    private updateCallbacks: Set<(market: MarketState) => void>;
+
+    constructor(rpcEndpoint: string) {
+        this.connection = new Connection(rpcEndpoint, 'confirmed');
+        this.marketCache = new Map();
+        this.poolStateSubscriptions = new Map();
+        this.updateCallbacks = new Set();
+    }
+
+    // Market Discovery and Monitoring
+    private async subscribeToPoolState(marketAddress: PublicKey, protocol: string) {
+        const subscriptionId = this.connection.onAccountChange(
+            marketAddress,
+            async (accountInfo) => {
+                const updatedState = await this.parsePoolState(accountInfo, protocol);
+                const marketState = this.marketCache.get(marketAddress.toString());
+                if (marketState) {
+                    marketState.poolState = updatedState;
+                    this.updateCallbacks.forEach(callback => callback(marketState));
+                }
+            }
+        );
+        this.poolStateSubscriptions.set(marketAddress.toString(), subscriptionId);
+    }
+
+    private async parsePoolState(accountInfo: AccountInfo<Buffer>, protocol: string): Promise<PoolState> {
+        switch (protocol) {
+            case 'raydium':
+                return this.parseRaydiumPoolState(accountInfo);
+            case 'orca':
+                return this.parseOrcaPoolState(accountInfo);
+            default:
+                throw new Error(`Unsupported protocol: ${protocol}`);
+        }
+    }
+
+    private parseRaydiumPoolState(accountInfo: AccountInfo<Buffer>): PoolState {
+        const decodedState = RAYDIUM_POOL_STATE_LAYOUT.decode(accountInfo.data);
+        return {
+            tokenAReserves: BigInt(decodedState.tokenAReserves.toString()),
+            tokenBReserves: BigInt(decodedState.tokenBReserves.toString()),
+            lastUpdateTimestamp: decodedState.lastUpdateTimestamp.toNumber(),
+            fees: {
+                tradeFee: decodedState.fees.tradeFee.toNumber() / 10000, // Convert to percentage
+                ownerFee: decodedState.fees.ownerFee.toNumber() / 10000,
+            },
+        };
+    }
+
+    // Quote calculation with price impact
+    private calculateQuote(
+        inputAmount: bigint,
+        poolState: PoolState,
+        isReverse: boolean
+    ): SwapQuote {
+        const { tokenAReserves, tokenBReserves, fees } = poolState;
+        const tradeFee = fees.tradeFee;
+        
+        // Calculate constant product k
+        const k = tokenAReserves * tokenBReserves;
+        
+        // Calculate amount with fees
+        const inputAmountWithFees = inputAmount * BigInt(Math.floor((1 - tradeFee) * 10000)) / BigInt(10000);
+        
+        let outputAmount: bigint;
+        if (isReverse) {
+            outputAmount = tokenAReserves - (k / (tokenBReserves + inputAmountWithFees));
+        } else {
+            outputAmount = tokenBReserves - (k / (tokenAReserves + inputAmountWithFees));
+        }
+        
+        // Calculate price impact
+        const priceImpact = this.calculatePriceImpact(
+            inputAmount,
+            outputAmount,
+            tokenAReserves,
+            tokenBReserves,
+            isReverse
+        );
+        
+        // Calculate fees
+        const fees = inputAmount * BigInt(Math.floor(tradeFee * 10000)) / BigInt(10000);
+        
+        // Calculate minimum output with 1% slippage
+        const minOutputAmount = outputAmount * BigInt(990) / BigInt(1000);
+        
+        return {
+            expectedAmount: outputAmount,
+            priceImpact,
+            fees,
+            minOutputAmount,
+        };
+    }
+
+    private calculatePriceImpact(
+        inputAmount: bigint,
+        outputAmount: bigint,
+        reserveA: bigint,
+        reserveB: bigint,
+        isReverse: boolean
+    ): number {
+        const spotPrice = isReverse ? 
+            Number(reserveA) / Number(reserveB) :
+            Number(reserveB) / Number(reserveA);
+            
+        const executionPrice = Number(outputAmount) / Number(inputAmount);
+        
+        return Math.abs((spotPrice - executionPrice) / spotPrice * 100);
+    }
+
+    // Multi-hop routing
+    private async findAllRoutes(
+        inputMint: PublicKey,
+        outputMint: PublicKey,
+        maxHops: number = 3
+    ): Promise<DexRoute[][]> {
+        const routes: DexRoute[][] = [];
+        const visited = new Set<string>();
+        
+        const findRoutes = async (
+            currentMint: PublicKey,
+            currentPath: DexRoute[],
+            remainingHops: number
+        ) => {
+            if (remainingHops === 0) {
+                if (currentMint.equals(outputMint)) {
+                    routes.push([...currentPath]);
+                }
+                return;
+            }
+            
+            visited.add(currentMint.toString());
+            
+            // Get all markets for current mint
+            const markets = await this.findMarketsForToken(currentMint);
+            
+            for (const market of markets) {
+                const nextMint = market.baseMint.equals(currentMint) ? 
+                    market.quoteMint : market.baseMint;
+                    
+                if (!visited.has(nextMint.toString())) {
+                    const route: DexRoute = {
+                        protocol: market.protocol,
+                        inputMint: currentMint,
+                        outputMint: nextMint,
+                        marketAddress: market.marketAddress,
+                        poolState: market.poolState,
+                    };
+                    
+                    currentPath.push(route);
+                    await findRoutes(nextMint, currentPath, remainingHops - 1);
+                    currentPath.pop();
+                }
+            }
+            
+            visited.delete(currentMint.toString());
+        };
+        
+        await findRoutes(inputMint, [], maxHops);
+        return routes;
+    }
+
+    // Route optimization
+    private async optimizeRoutes(
+        routes: DexRoute[][],
+        inputAmount: bigint
+    ): Promise<RoutingInfo[]> {
+        const optimizedRoutes: RoutingInfo[] = [];
+        
+        for (const route of routes) {
+            let currentAmount = inputAmount;
+            let totalPriceImpact = 0;
+            let totalFees = BigInt(0);
+            
+            // Simulate the swap through each hop
+            for (const hop of route) {
+                const quote = await this.getQuote(hop, currentAmount);
+                if (!quote) continue;
+                
+                currentAmount = quote.expectedAmount;
+                totalPriceImpact += quote.priceImpact;
+                totalFees += quote.fees;
+            }
+            
+            if (currentAmount > BigInt(0)) {
+                optimizedRoutes.push({
+                    route,
+                    expectedOutputAmount: currentAmount,
+                    priceImpact: totalPriceImpact,
+                    estimatedFees: totalFees,
+                });
+            }
+        }
+        
+        // Sort by expected output amount (descending)
+        return optimizedRoutes.sort((a, b) => 
+            Number(b.expectedOutputAmount - a.expectedOutputAmount)
+        );
+    }
+
+    // Swap instruction creation with retries
+    async executeSwap(
+        route: RoutingInfo,
+        userPublicKey: PublicKey,
+        maxRetries: number = 3
+    ): Promise<Transaction> {
+        let lastError: Error | null = null;
+        
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const transaction = new Transaction();
+                
+                // Add instructions for each hop
+                for (let i = 0; i < route.route.length; i++) {
+                    const hop = route.route[i];
+                    const inputAmount = i === 0 ? 
+                        route.expectedOutputAmount :
+                        (await this.getQuote(hop, route.expectedOutputAmount))?.expectedAmount;
+                        
+                    if (!inputAmount) throw new Error('Failed to get quote for hop');
+                    
+                    const instructions = await this.getSwapInstructions(
+                        hop,
+                        userPublicKey,
+                        inputAmount
+                    );
+                    
+                    transaction.add(...instructions);
+                }
+                
+                // Get recent blockhash
+                const { blockhash } = await this.connection.getRecentBlockhash();
+                transaction.recentBlockhash = blockhash;
+                transaction.feePayer = userPublicKey;
+                
+                return transaction;
+            } catch (error) {
+                lastError = error as Error;
+                // Wait before retrying
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+            }
+        }
+        
+        throw new Error(`Failed to execute swap after ${maxRetries} attempts: ${lastError?.message}`);
+    }
+
+    // Public API methods
+    async findBestRoute(
+        inputMint: PublicKey,
+        outputMint: PublicKey,
+        amount: bigint,
+        maxHops: number = 3
+    ): Promise<RoutingInfo[]> {
+        // Find all possible routes
+        const routes = await this.findAllRoutes(inputMint, outputMint, maxHops);
+        
+        // Optimize and sort routes
+        const optimizedRoutes = await this.optimizeRoutes(routes, amount);
+        
+        return optimizedRoutes;
+    }
+
+    onPoolStateUpdate(callback: (market: MarketState) => void) {
+        this.updateCallbacks.add(callback);
+        return () => {
+            this.updateCallbacks.delete(callback);
+        };
+    }
+
+    async cleanup() {
+        // Unsubscribe from all pool state updates
+        for (const [address, subscriptionId] of this.poolStateSubscriptions) {
+            await this.connection.removeAccountChangeListener(subscriptionId);
+        }
+        this.poolStateSubscriptions.clear();
+        this.updateCallbacks.clear();
+    }
+}
+
+export default CustomDexAggregator;
